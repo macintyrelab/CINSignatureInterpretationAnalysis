@@ -1,0 +1,259 @@
+---
+title: "Generation of signature interpretation matrix from simulated genomes"
+output: 
+  pdf_document:
+    number_sections: true
+---
+
+```{r setup, message=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+
+options(java.parameters = "-Xmx8000m")
+library(data.table)
+library(dplyr)
+library(ggpubr)
+library(ggrepel)
+library(sjPlot)
+library(tidyverse)
+library(rstatix)
+library(reshape2)
+library(ggplot2)
+library(ggthemes)
+library(lemon)
+library(RColorBrewer)
+library(coin)
+
+# PATHWAYS
+BASE <- dirname(rstudioapi::getSourceEditorContext()$path)
+INPUT_DIR <- file.path(BASE,"data")
+OUTPUT_DIR <- file.path(BASE,"output")
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# PLOTS THEME
+theme_set(theme_tufte(base_size = 6, base_family = "ArialMT"))
+theme_update(text = element_text(size = 6),
+             axis.text = element_text(size = 6),
+             axis.line = element_line(size = 0.5), 
+             axis.ticks = element_line(size = 0.5),
+             axis.ticks.length = unit(.1, "cm"))
+```
+
+# LOAD DATA
+```{r data}
+#CIN process simulated per sample 
+Simulations_overview <- readRDS(paste0(INPUT_DIR,"/Out_2_Step_3_Overview_simulation_20each_N240_RubenParam2.rds"))
+colnames(Simulations_overview)[2] <- "sampleID"
+
+#Normalize matrix
+#Sample per components matrix
+Simulations_components <- t(read.table(paste0(INPUT_DIR,"/Out_4_Step_3_CxS_Matrix_20each_N240_RubenParam2_noChimeric.txt"), sep="\t", header = T, check.names=FALSE))
+#Normalize matrix
+Simulations_components[,c(1:22)] <- t(apply(Simulations_components[,c(1:22)],1,function(x){x/sum(x)}))
+Simulations_components[,c(23:32)] <- t(apply(Simulations_components[,c(23:32)],1,function(x){x/sum(x)}))
+Simulations_components[,c(33:35)] <- t(apply(Simulations_components[,c(33:35)],1,function(x){x/sum(x)}))
+Simulations_components[,c(36:40)] <- t(apply(Simulations_components[,c(36:40)],1,function(x){x/sum(x)}))
+Simulations_components[,c(41:43)] <- t(apply(Simulations_components[,c(41:43)],1,function(x){x/sum(x)}))
+components <- colnames(Simulations_components)
+
+#CNSig exposure per sample
+Simulations_signatures <- readRDS(paste0(INPUT_DIR,"/Out_6_Activities_20each_N240_RubenParam2_CxSBefore_SigsBefore.rds"))
+
+#CNSig definitions (weights per component)
+SIMSig_definitions <- readRDS(paste0(INPUT_DIR,"/Out_6_Signatures_XK5TRD_normalised_RubenParam2_noChimeric.rds"))
+```
+
+# ACTIVITY THRESHOLDS
+We calculated signature-specific thresholds to ensure activity levels are true. Activity levels below to the specific threshold are corrected to zero.
+```{r}
+## Repair names
+vNamesRepair = sapply(as.character(rownames(Simulations_signatures)), function(thisName) {
+  if(nchar(thisName) == 7) {
+    return(substr(thisName, 2, 7))
+  } else {
+    return(thisName)
+  }
+})
+rownames(Simulations_signatures) <- vNamesRepair
+
+mutprocesses <- c("LST","ecDNA","Chr","WGDearly","WGDlate")
+Corrected_Signatures <- c()
+for (i in 1:ncol(Simulations_signatures)){
+  act <- as.data.frame(cbind(sampleID=rownames(Simulations_signatures),level=Simulations_signatures[,i]))
+  
+  #get samples with no signature operating
+  Simulations_overview$samps <- FALSE
+  for (j in 1:nrow(Simulations_overview)){
+    if(i<=3 & !str_detect(Simulations_overview$Signature[j], "WGD")){
+      Simulations_overview$samps[j] <- TRUE
+    }
+    if(i<=3 & str_detect(Simulations_overview$Signature[j], "WGD") & str_detect(Simulations_overview$Signature[j], mutprocesses[i])){
+      Simulations_overview$samps[j] <- TRUE
+    }
+    if(i==4 & str_detect(Simulations_overview$Signature[j], "WGDearly")){
+      Simulations_overview$samps[j] <- TRUE
+    }
+    if(i==5 & str_detect(Simulations_overview$Signature[j], "WGDlate")){
+      Simulations_overview$samps[j] <- TRUE
+    }
+  }
+  noAct <- Simulations_overview$sampleID[Simulations_overview$samps==FALSE]
+  dt <- left_join(act, Simulations_overview, by="sampleID")
+  noAct <- dt[dt$samps==FALSE,]
+  
+  #set threshold in 80%
+  noAct$level <- as.numeric(noAct$level)
+  noAct <- noAct[order(-noAct$level),]
+  thr <- nrow(noAct)-(80*nrow(noAct)/100)
+  thr <- noAct[thr,2]
+  
+  #change to zero these samples with value lower than threhold
+  act$level[act$level<=thr]<-0
+  Corrected_Signatures<-cbind(Corrected_Signatures,as.numeric(act$level))
+}
+colnames(Corrected_Signatures)<-colnames(Simulations_signatures)
+rownames(Corrected_Signatures)<-rownames(Simulations_signatures)
+```
+
+# LINEAR CORRELATIONS
+For each signature, we detect components that are positively correlated with activity levels
+```{r lm}
+CNsigs <- colnames(Corrected_Signatures)
+component <- colnames(Simulations_components)
+
+#Sig activity
+sigs <- reshape2::melt(Corrected_Signatures)
+colnames(sigs) <- c("sampleID", "CNSig", "level")
+## Repair names
+sigs$sampleID <- as.character(sigs$sampleID)
+vNamesRepair = sapply(sigs$sampleID, function(thisName) {
+  if(nchar(thisName) == 7) {
+    return(substr(thisName, 2, 7))
+  } else {
+    return(thisName)
+  }
+})
+sigs$sampleID <- vNamesRepair
+
+#Sum-of-posterior
+comps <- reshape2::melt(t(Simulations_components))
+colnames(comps)<-c("component", "sampleID", "value")
+
+#Join
+dat <- left_join(sigs,comps, by="sampleID")
+
+#Linear correlation 
+res <- dat[dat$level!=0,] %>% group_by(CNSig,component) %>% do(tidy(lm(level ~ value, data = .)))
+res$beta <- res$term=="value"
+res <- res[res$beta==TRUE,] #remove intercept values
+#Correct pvalues
+res$p.adj <- p.adjust(res$p.value, "BH")
+```
+
+# MIX INFORMATION IN INPUT MATRIX AND ACTIVITY MATRIX
+```{r mix}
+# Denormalize components matrix
+comps <- Simulations_components
+comps[,c(1:22)] <- t(apply(comps[,c(1:22)],1,function(x){x*22}))
+comps[,c(23:32)] <- t(apply(comps[,c(23:32)],1,function(x){x*10}))
+comps[,c(33:35)] <- t(apply(comps[,c(33:35)],1,function(x){x*3}))
+comps[,c(36:40)] <- t(apply(comps[,c(36:40)],1,function(x){x*5}))
+comps[,c(41:43)] <- t(apply(comps[,c(41:43)],1,function(x){x*3}))
+comps <- reshape2::melt(t(comps))
+colnames(comps)<-c("component", "sampleID", "value")
+dat <- left_join(sigs,comps, by="sampleID")
+
+# Multiply component weights and activity level per sample
+dat$strength <- dat$value*dat$level
+
+# Sum strength of each component per signature
+dat <- dat %>% group_by(CNSig,component) %>% summarise(sum=sum(strength))
+dat <- left_join(dat, res, by=c("CNSig", "component"))
+
+# Normalize values to one
+dat[,"sum"] <- apply(dat[,"sum"],2,function(x){x/sum(x)})
+```
+
+# ADD INFORMATION OF SIGNATURE DEFINITIONS MATRIX FOR GENERATING THE INTERPRETATION MATRIX
+```{r interpret}
+defs <- reshape2::melt(t(SIMSig_definitions))
+colnames(defs)<-c("component", "CNSig", "weights")
+defs$CNSig <- as.character(defs$CNSig)
+defs$CNSig[defs$CNSig=="W3"]<-"HRDLST"
+defs$CNSig[defs$CNSig=="W5"]<-"ecDNA"
+defs$CNSig[defs$CNSig=="W1"]<-"CHR"
+defs$CNSig[defs$CNSig=="W4"]<-"WGDearly"
+defs$CNSig[defs$CNSig=="W2"]<-"WGDlate"
+dat <- left_join(dat, defs, by=c("CNSig", "component"))
+
+# Normalize values to one
+dat[,"weights"] <- apply(dat[,"weights"],2,function(x){x/sum(x)})
+
+# Sum values from both matrices
+dat$allSum <- dat$sum + dat$weights
+```
+
+# PLOT POSITIVELY CORRELATED COMPONENTS 
+```{r plot}
+## Prepare data for plotting
+# 1. Select samples with significant (pvalue<0.05) and positive (beta>0) correlations
+dat$plot <- dat$estimate>=0 #& dat$p.value<0.05
+
+# 2. Mask no-significant
+dat$allSum[dat$plot==FALSE]<-0
+
+# 3. Normalize sum per signature & feature
+dt <- list()
+dt <- lapply(CNsigs, function(sig){
+  s <- dat[dat$CNSig==sig,]
+  # s[,"allSum"] <- apply(s[,"allSum"],2,function(x){x/sum(x)})
+  s[c(1:22),"allSum"] <- apply(s[c(1:22),"allSum"],2,function(x){x/sum(x)})
+  s[c(23:32),"allSum"] <- apply(s[c(23:32),"allSum"],2,function(x){x/sum(x)})
+  s[c(33:35),"allSum"] <- apply(s[c(33:35),"allSum"],2,function(x){x/sum(x)})
+  s[c(36:40),"allSum"] <- apply(s[c(36:40),"allSum"],2,function(x){x/sum(x)})
+  s[c(41:43),"allSum"] <- apply(s[c(41:43),"allSum"],2,function(x){x/sum(x)})
+  dt[[sig]]<-s
+})
+names(dt)<-CNsigs
+dt <- do.call(rbind, dt)
+#dt$allSum[is.nan(dt$allSum)]<-0
+
+# 4. Define categories of variables
+dt$component <- factor(dt$component, levels = rev(component))
+dt$CNSig <- factor(dt$CNSig, levels = CNsigs)
+
+# 5. Discretize signature interpretation values
+breaks = c(0, 1e-11, 0.05, 0.1, 0.5, 1)
+# Names of categories
+tags = c("0", ">0%", ">5%", ">10%", ">50%")
+# Split allSum into somewhat meaningful categories
+dt$Disc = cut(dt$allSum, breaks = breaks, include.lowest=TRUE, right=FALSE, labels = tags)
+# Colors
+# blue gradient
+cols = c("0" = "#FFFFFF", ">0%" = "#ece7f2", 
+         ">5%" = "#a6bddb", ">10%"= "#3690c0", 
+         ">50%"= "#045a8d")
+
+# Plot mean of sum of posterior values per component in the group with high activity
+pB = ggplot(dt, aes(y = component, x = CNSig, fill = Disc)) + 
+  geom_tile(aes(width = 0.94, height = 0.94)) + 
+  theme_tufte(base_family = "", base_size = 16) + 
+  theme(legend.position = "bottom", legend.justification = "right", legend.title = element_text(size=12), legend.text = element_text(size=10), 
+        axis.line = element_line(size = 0.5), axis.ticks = element_line(size = 0.5), 
+        axis.ticks.length = unit(.1, "cm"), plot.margin = unit(c(0, 0, 0, 0), "null"), aspect.ratio = 43/17) + 
+  labs(x = "CIN signature", y = "Feature components") + 
+  scale_x_discrete(position = "top", guide = guide_axis(angle = 90)) + labs(fill = "Interpretation values\nBeta > 0") +
+  scale_fill_manual(values = cols) + 
+  guides(fill = guide_legend(nrow = 1)) +
+  coord_capped_cart(top = "both", left = "both")
+
+print(pB)
+# ## Save output
+# cairo_pdf(file.path(OUTPUT_DIR, "Figure_IntMatrix_Simulations_80thThrehold.pdf"), height = 230/25.4, width = 161/25.4)
+# print(pB); dev.off()
+ggsave(file.path(OUTPUT_DIR, "SuppFig_xx_Simulations_signature_interpretation_vertical.svg"), pB, height = 230/25.4, width = 161/25.4)
+
+# ## Save file
+write.table(dt, file=paste0(OUTPUT_DIR,"/InterpretationMatrix_simulations.txt"), sep="\t", col.names = TRUE, quote = FALSE)
+```
